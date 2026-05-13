@@ -28,6 +28,10 @@ The integral is discretised with a uniform grid over the aperture square
 [-r_ap, r_ap]² and the circular mask is applied analytically.
 """
 
+import os
+from concurrent.futures import ProcessPoolExecutor
+
+import numexpr as ne
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -40,17 +44,30 @@ r_ap = 1e-3                              # aperture radius  [m]
 P2   = np.array([0.0, -50e-2, 0.0])     # source: on-axis, 50 mm behind screen
 
 # Primary observation plane
-obs_y    = 20e-2                         # distance beyond screen  [m]
+obs_y    = 20e-3                         # distance beyond screen  [m]
 obs_half = 3 * r_ap                      # ±half-width of observation window  [m]
-N_obs    = 200                            # obs-grid size per side
+N_obs    = 400                            # obs-grid size per side
 
 # Aperture quadrature: increase N_ap for accuracy, decrease for speed.
 # Rule of thumb: N_ap ≥ 2 · r_ap · sin(θ_max) / λ  where θ_max = r_ap / obs_y
-N_ap = 200
+N_ap = 400
 
 
 
 # ─── Core integral ──────────────────────────────────────────────────────────────
+def _rs_columns(args):
+    """Worker: RS integral for a contiguous slice of x observation coordinates."""
+    x_slice, y0, Z0, X1_ap, Z1_ap, Uap_ap, k, ds = args
+    wavelength = 2 * np.pi / k
+    out = np.zeros((Z0.shape[0], len(x_slice)), dtype=complex)
+    for i, x0 in enumerate(x_slice):
+        r01       = np.sqrt((X1_ap - x0)**2 + y0**2 + (Z0 - Z1_ap)**2)
+        cos_theta = y0 / r01
+        integrand = Uap_ap * np.exp(1j * k * r01) / r01 * cos_theta / (1j * wavelength)
+        out[:, i] = np.sum(integrand, axis=-1) * ds**2
+    return out
+
+
 def _aperture_grid(r_ap: float, N_ap: int):
     """Uniform grid covering the aperture square with a circular mask."""
     s  = np.linspace(-r_ap, r_ap, N_ap)
@@ -93,46 +110,48 @@ def rs_single(P0, P2, k, A, r_ap, N_ap=200):
     return np.sum(np.where(mask, integrand, 0.0)) * ds**2
 
 
-def rs_plane(y0, x_obs, z_obs, k, U_ap, X1, Z1, ds):
+def rs_plane(y0, x_obs, z_obs, k, U_ap, X1, Z1, ds, n_workers=None):
     """
     RS phasor field on a 2-D observation plane at fixed depth y0.
 
     Only sums over aperture points where U_ap is non-zero, so the grid
     may be larger than the aperture without a performance penalty.
+    The x-loop is parallelised across n_workers processes.
 
     Parameters
     ----------
-    y0     : float          — observation plane depth along y-axis
-    x_obs  : (Nx,) array    — x coordinates on observation plane
-    z_obs  : (Nz,) array    — z coordinates on observation plane
-    k      : float          — wavenumber [rad/m]
-    U_ap   : (N, N) complex — aperture field (zeros outside aperture)
-    X1     : (N, N) float   — x grid coordinates matching U_ap
-    Z1     : (N, N) float   — z grid coordinates matching U_ap
-    ds     : float          — grid spacing [m]
+    y0         : float          — observation plane depth along y-axis
+    x_obs      : (Nx,) array    — x coordinates on observation plane
+    z_obs      : (Nz,) array    — z coordinates on observation plane
+    k          : float          — wavenumber [rad/m]
+    U_ap       : (N, N) complex — aperture field (zeros outside aperture)
+    X1         : (N, N) float   — x grid coordinates matching U_ap
+    Z1         : (N, N) float   — z grid coordinates matching U_ap
+    ds         : float          — grid spacing [m]
+    n_workers  : int or None    — parallel workers (default: os.cpu_count())
 
     Returns
     -------
     U : complex ndarray, shape (Nz, Nx)
     """
-    wavelength = 2 * np.pi / k
-
     # Flatten to aperture-only points to keep memory bounded
-    ap        = U_ap != 0
-    X1_ap     = X1[ap]    # (N_eff,)
-    Z1_ap     = Z1[ap]    # (N_eff,)
-    Uap_ap    = U_ap[ap]  # (N_eff,)
+    ap     = U_ap != 0
+    X1_ap  = X1[ap]    # (N_eff,)
+    Z1_ap  = Z1[ap]    # (N_eff,)
+    Uap_ap = U_ap[ap]  # (N_eff,)
+    Z0     = z_obs[:, np.newaxis]  # (Nz, 1)
 
-    U  = np.zeros((len(z_obs), len(x_obs)), dtype=complex)
-    Z0 = z_obs[:, np.newaxis]  # (Nz, 1)
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
 
-    for ix, x0 in enumerate(x_obs):
-        r01       = np.sqrt((X1_ap - x0)**2 + y0**2 + (Z0 - Z1_ap)**2)  # (Nz, N_eff)
-        cos_theta = y0 / r01
-        integrand = Uap_ap * np.exp(1j * k * r01) / r01 * cos_theta / (1j * wavelength)
-        U[:, ix]  = np.sum(integrand, axis=-1) * ds**2
+    # Split x_obs into one chunk per worker; each chunk is computed independently.
+    chunks    = np.array_split(x_obs, n_workers)
+    task_args = [(c, y0, Z0, X1_ap, Z1_ap, Uap_ap, k, ds) for c in chunks]
 
-    return U
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        parts = list(executor.map(_rs_columns, task_args))
+
+    return np.concatenate(parts, axis=1)
 
 def asm_plane(U_ap, ds, y0, k):
     """
@@ -175,70 +194,71 @@ N_asm  = 1024    # power-of-2 grid; total extent ≈ 8.19 mm (> 2 × obs_half)
 s_asm        = (np.arange(N_asm) - N_asm // 2) * ds_asm   # centered coordinates
 X_asm, Z_asm = np.meshgrid(s_asm, s_asm)
 
-r21_ap = np.sqrt((X_asm - P2[0])**2 + P2[1]**2 + (Z_asm - P2[2])**2)
-U_ap   = np.where(X_asm**2 + Z_asm**2 <= r_ap**2,
-                  A * np.exp(1j * k * r21_ap) / r21_ap,
-                  0.0)
+x2, y2, z2 = P2
+r21_ap = ne.evaluate("sqrt((X_asm - x2)**2 + y2**2 + (Z_asm - z2)**2)")
+U_ap   = ne.evaluate("where(X_asm**2 + Z_asm**2 <= r_ap**2,"
+                     "      A * exp(1j * k * r21_ap) / r21_ap, 0+0j)")
 
-# ─── RS simulation ─────────────────────────────────────────────────────────────
-x_obs = np.linspace(-obs_half, obs_half, N_obs)
-z_obs = np.linspace(-obs_half, obs_half, N_obs)
-U_rs  = rs_plane(obs_y, x_obs, z_obs, k, U_ap, X_asm, Z_asm, ds_asm)
+if __name__ == '__main__':
+    # ─── RS simulation ─────────────────────────────────────────────────────────
+    x_obs = np.linspace(-obs_half, obs_half, N_obs)
+    z_obs = np.linspace(-obs_half, obs_half, N_obs)
+    U_rs  = rs_plane(obs_y, x_obs, z_obs, k, U_ap, X_asm, Z_asm, ds_asm)
 
-# ─── ASM simulation ─────────────────────────────────────────────────────────────
-U_asm_full = asm_plane(U_ap, ds_asm, obs_y, k)
+    # ─── ASM simulation ────────────────────────────────────────────────────────
+    U_asm_full = asm_plane(U_ap, ds_asm, obs_y, k)
 
-# Crop to the same ±obs_half window used by RS
-i_lo  = np.searchsorted(s_asm, -obs_half)
-i_hi  = np.searchsorted(s_asm,  obs_half)
-U_asm = U_asm_full[i_lo:i_hi, i_lo:i_hi]
-s_roi = s_asm[i_lo:i_hi]
+    # Crop to the same ±obs_half window used by RS
+    i_lo  = np.searchsorted(s_asm, -obs_half)
+    i_hi  = np.searchsorted(s_asm,  obs_half)
+    U_asm = U_asm_full[i_lo:i_hi, i_lo:i_hi]
+    s_roi = s_asm[i_lo:i_hi]
 
-# ─── Comparison plot ───────────────────────────────────────────────────────────
-mm      = 1e-3
-ext_rs  = np.array([-obs_half, obs_half, -obs_half, obs_half]) / mm
-ext_asm = np.array([s_roi[0], s_roi[-1], s_roi[0], s_roi[-1]]) / mm
+    # ─── Comparison plot ───────────────────────────────────────────────────────
+    mm      = 1e-3
+    ext_rs  = np.array([-obs_half, obs_half, -obs_half, obs_half]) / mm
+    ext_asm = np.array([s_roi[0], s_roi[-1], s_roi[0], s_roi[-1]]) / mm
 
-fig, axes = plt.subplots(2, 2, figsize=(10, 9))
-(ax_rs_amp, ax_rs_ph), (ax_asm_amp, ax_asm_ph) = axes
+    fig, axes = plt.subplots(2, 2, figsize=(10, 9))
+    (ax_rs_amp, ax_rs_ph), (ax_asm_amp, ax_asm_ph) = axes
 
-# RS row
-im = ax_rs_amp.imshow(np.abs(U_rs), extent=ext_rs, origin='lower',
-                      cmap='inferno', aspect='equal')
-ax_rs_amp.set_title("|U|  — Rayleigh-Sommerfeld")
-ax_rs_amp.set_xlabel("x  [mm]")
-ax_rs_amp.set_ylabel("z  [mm]")
-fig.colorbar(im, ax=ax_rs_amp, fraction=0.046)
+    # RS row
+    im = ax_rs_amp.imshow(np.abs(U_rs), extent=ext_rs, origin='lower',
+                          cmap='inferno', aspect='equal')
+    ax_rs_amp.set_title("|U|  — Rayleigh-Sommerfeld")
+    ax_rs_amp.set_xlabel("x  [mm]")
+    ax_rs_amp.set_ylabel("z  [mm]")
+    fig.colorbar(im, ax=ax_rs_amp, fraction=0.046)
 
-im = ax_rs_ph.imshow(np.angle(U_rs), extent=ext_rs, origin='lower',
-                     cmap='hsv', vmin=-np.pi, vmax=np.pi, aspect='equal')
-ax_rs_ph.set_title("∠U  — Rayleigh-Sommerfeld")
-ax_rs_ph.set_xlabel("x  [mm]")
-ax_rs_ph.set_ylabel("z  [mm]")
-fig.colorbar(im, ax=ax_rs_ph, label="[rad]", fraction=0.046)
+    im = ax_rs_ph.imshow(np.angle(U_rs), extent=ext_rs, origin='lower',
+                         cmap='hsv', vmin=-np.pi, vmax=np.pi, aspect='equal')
+    ax_rs_ph.set_title("∠U  — Rayleigh-Sommerfeld")
+    ax_rs_ph.set_xlabel("x  [mm]")
+    ax_rs_ph.set_ylabel("z  [mm]")
+    fig.colorbar(im, ax=ax_rs_ph, label="[rad]", fraction=0.046)
 
-# ASM row
-im = ax_asm_amp.imshow(np.abs(U_asm), extent=ext_asm, origin='lower',
-                       cmap='inferno', aspect='equal')
-ax_asm_amp.set_title("|U|  — Angular Spectrum")
-ax_asm_amp.set_xlabel("x  [mm]")
-ax_asm_amp.set_ylabel("z  [mm]")
-fig.colorbar(im, ax=ax_asm_amp, fraction=0.046)
+    # ASM row
+    im = ax_asm_amp.imshow(np.abs(U_asm), extent=ext_asm, origin='lower',
+                           cmap='inferno', aspect='equal')
+    ax_asm_amp.set_title("|U|  — Angular Spectrum")
+    ax_asm_amp.set_xlabel("x  [mm]")
+    ax_asm_amp.set_ylabel("z  [mm]")
+    fig.colorbar(im, ax=ax_asm_amp, fraction=0.046)
 
-im = ax_asm_ph.imshow(np.angle(U_asm), extent=ext_asm, origin='lower',
-                      cmap='hsv', vmin=-np.pi, vmax=np.pi, aspect='equal')
-ax_asm_ph.set_title("∠U  — Angular Spectrum")
-ax_asm_ph.set_xlabel("x  [mm]")
-ax_asm_ph.set_ylabel("z  [mm]")
-fig.colorbar(im, ax=ax_asm_ph, label="[rad]", fraction=0.046)
+    im = ax_asm_ph.imshow(np.angle(U_asm), extent=ext_asm, origin='lower',
+                          cmap='hsv', vmin=-np.pi, vmax=np.pi, aspect='equal')
+    ax_asm_ph.set_title("∠U  — Angular Spectrum")
+    ax_asm_ph.set_xlabel("x  [mm]")
+    ax_asm_ph.set_ylabel("z  [mm]")
+    fig.colorbar(im, ax=ax_asm_ph, label="[rad]", fraction=0.046)
 
-fig.suptitle(
-    f"Diffraction at y = {obs_y*1e3:.0f} mm  "
-    f"(λ = {lam*1e9:.0f} nm,  r_ap = {r_ap*1e3:.0f} mm)",
-    fontweight='bold')
-plt.tight_layout()
+    fig.suptitle(
+        f"Diffraction at y = {obs_y*1e3:.0f} mm  "
+        f"(λ = {lam*1e9:.0f} nm,  r_ap = {r_ap*1e3:.0f} mm)",
+        fontweight='bold')
+    plt.tight_layout()
 
-out = "diffraction.png"
-plt.savefig(out, dpi=150, bbox_inches='tight')
-plt.show()
-print(f"Saved → {out}")
+    out = "diffraction.png"
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"Saved → {out}")
