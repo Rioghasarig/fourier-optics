@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+Rayleigh-Sommerfeld Diffraction Simulation
+==========================================
+Coordinate system:
+  - x : toward the reader
+  - y : to the right  (optical axis)
+  - z : up
+
+Geometry:
+  - Planar screen in the x–z plane (y = 0) with a circular aperture of
+    radius r_ap centered at the origin
+  - Point source P2 at y < 0  (to the left of the screen)
+  - Observation points P0 at y > 0  (to the right of the screen)
+
+RS first-solution formula (Dirichlet Green's function):
+
+    U(P0) = (1/iλ) ∬_Σ U_inc(P1) · [e^(ikr01)/r01] · cos θ  dA
+
+where:
+    U_inc(P1) = A · e^(ikr21) / r21        spherical wave at aperture point P1
+    r21        = |P1 − P2|
+    r01        = |P0 − P1|
+    cos θ      = y0 / r01                  obliquity factor (screen normal = ŷ)
+    λ          = 2π/k
+
+The integral is discretised with a uniform grid over the aperture square
+[-r_ap, r_ap]² and the circular mask is applied analytically.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ─── Parameters ────────────────────────────────────────────────────────────────
+lam  = 500e-9                            # wavelength  [m]
+k    = 2 * np.pi / lam                   # wavenumber  [rad/m]
+A    = 1.0                               # source amplitude  (arbitrary units)
+r_ap = 1e-3                              # aperture radius  [m]
+P2   = np.array([0.0, -50e-2, 0.0])     # source: on-axis, 50 mm behind screen
+
+# Primary observation plane
+obs_y    = 20e-2                         # distance beyond screen  [m]
+obs_half = 3 * r_ap                      # ±half-width of observation window  [m]
+N_obs    = 200                            # obs-grid size per side
+
+# Aperture quadrature: increase N_ap for accuracy, decrease for speed.
+# Rule of thumb: N_ap ≥ 2 · r_ap · sin(θ_max) / λ  where θ_max = r_ap / obs_y
+N_ap = 200
+
+
+
+# ─── Core integral ──────────────────────────────────────────────────────────────
+def _aperture_grid(r_ap: float, N_ap: int):
+    """Uniform grid covering the aperture square with a circular mask."""
+    s  = np.linspace(-r_ap, r_ap, N_ap)
+    ds = s[1] - s[0]
+    X1, Z1 = np.meshgrid(s, s)
+    mask = (X1**2 + Z1**2) <= r_ap**2
+    return X1, Z1, mask, ds
+
+
+def rs_single(P0, P2, k, A, r_ap, N_ap=200):
+    """
+    RS phasor at a single observation point P0.
+
+    Parameters
+    ----------
+    P0 : (3,) array-like  — observation point, y > 0
+    P2 : (3,) array-like  — source point, y < 0
+    k  : float            — wavenumber
+    A  : float            — source amplitude
+    r_ap : float          — aperture radius
+    N_ap : int            — quadrature grid points per side
+
+    Returns
+    -------
+    complex scalar
+    """
+    x0, y0, z0 = P0
+    x2, y2, z2 = P2
+    wavelength = 2 * np.pi / k
+
+    X1, Z1, mask, ds = _aperture_grid(r_ap, N_ap)
+
+    r21 = np.sqrt((X1 - x2)**2 + y2**2 + (Z1 - z2)**2)
+    r01 = np.sqrt((X1 - x0)**2 + y0**2 + (Z1 - z0)**2)
+
+    U_inc     = A * np.exp(1j * k * r21) / r21
+    cos_theta = y0 / r01                        # screen normal = ŷ  (points right)
+    integrand = U_inc * np.exp(1j * k * r01) / r01 * cos_theta / (1j * wavelength)
+
+    return np.sum(np.where(mask, integrand, 0.0)) * ds**2
+
+
+def rs_plane(y0, x_obs, z_obs, k, U_ap, X1, Z1, ds):
+    """
+    RS phasor field on a 2-D observation plane at fixed depth y0.
+
+    Only sums over aperture points where U_ap is non-zero, so the grid
+    may be larger than the aperture without a performance penalty.
+
+    Parameters
+    ----------
+    y0     : float          — observation plane depth along y-axis
+    x_obs  : (Nx,) array    — x coordinates on observation plane
+    z_obs  : (Nz,) array    — z coordinates on observation plane
+    k      : float          — wavenumber [rad/m]
+    U_ap   : (N, N) complex — aperture field (zeros outside aperture)
+    X1     : (N, N) float   — x grid coordinates matching U_ap
+    Z1     : (N, N) float   — z grid coordinates matching U_ap
+    ds     : float          — grid spacing [m]
+
+    Returns
+    -------
+    U : complex ndarray, shape (Nz, Nx)
+    """
+    wavelength = 2 * np.pi / k
+
+    # Flatten to aperture-only points to keep memory bounded
+    ap        = U_ap != 0
+    X1_ap     = X1[ap]    # (N_eff,)
+    Z1_ap     = Z1[ap]    # (N_eff,)
+    Uap_ap    = U_ap[ap]  # (N_eff,)
+
+    U  = np.zeros((len(z_obs), len(x_obs)), dtype=complex)
+    Z0 = z_obs[:, np.newaxis]  # (Nz, 1)
+
+    for ix, x0 in enumerate(x_obs):
+        r01       = np.sqrt((X1_ap - x0)**2 + y0**2 + (Z0 - Z1_ap)**2)  # (Nz, N_eff)
+        cos_theta = y0 / r01
+        integrand = Uap_ap * np.exp(1j * k * r01) / r01 * cos_theta / (1j * wavelength)
+        U[:, ix]  = np.sum(integrand, axis=-1) * ds**2
+
+    return U
+
+def asm_plane(U_ap, ds, y0, k):
+    """
+    Propagate a 2-D field by distance y0 using the angular spectrum method.
+
+    U_ap must be centered in the array (index [N//2, N//2] = spatial origin).
+    ifftshift/fftshift move the origin to/from the FFT's expected [0,0] corner.
+
+    Parameters
+    ----------
+    U_ap : (N, N) complex array — field at source plane, centered in array
+    ds   : float               — grid spacing [m]
+    y0   : float               — propagation distance [m]
+    k    : float               — wavenumber [rad/m]
+
+    Returns
+    -------
+    U_prop : (N, N) complex array — propagated field, same grid as U_ap
+    """
+    N  = U_ap.shape[0]
+    fx = np.fft.fftfreq(N, d=ds)
+    Fx, Fz = np.meshgrid(fx, fx)
+
+  
+    ky_sq = k**2 - ( 2 * np.pi * Fx )**2 - (2 * np.pi * Fz)**2
+    ky    = np.sqrt(np.maximum(ky_sq, 0.0))
+
+    H = np.exp(1j * ky * y0)
+    H[ky_sq < 0] = 0.0   # zero evanescent components
+
+    A_spec = np.fft.fft2(U_ap)
+    return np.fft.ifft2(A_spec * H)
+
+
+# ─── Shared aperture field (used by both RS and ASM) ───────────────────────────
+# Grid satisfies ds ≤ λ/(2 sin θ_max) ≈ 12.5 µm and spans > ±obs_half.
+ds_asm = 8e-6    # 8 µm, safely below the 12.5 µm Nyquist limit
+N_asm  = 1024    # power-of-2 grid; total extent ≈ 8.19 mm (> 2 × obs_half)
+
+s_asm        = (np.arange(N_asm) - N_asm // 2) * ds_asm   # centered coordinates
+X_asm, Z_asm = np.meshgrid(s_asm, s_asm)
+
+r21_ap = np.sqrt((X_asm - P2[0])**2 + P2[1]**2 + (Z_asm - P2[2])**2)
+U_ap   = np.where(X_asm**2 + Z_asm**2 <= r_ap**2,
+                  A * np.exp(1j * k * r21_ap) / r21_ap,
+                  0.0)
+
+# ─── RS simulation ─────────────────────────────────────────────────────────────
+x_obs = np.linspace(-obs_half, obs_half, N_obs)
+z_obs = np.linspace(-obs_half, obs_half, N_obs)
+U_rs  = rs_plane(obs_y, x_obs, z_obs, k, U_ap, X_asm, Z_asm, ds_asm)
+
+# ─── ASM simulation ─────────────────────────────────────────────────────────────
+U_asm_full = asm_plane(U_ap, ds_asm, obs_y, k)
+
+# Crop to the same ±obs_half window used by RS
+i_lo  = np.searchsorted(s_asm, -obs_half)
+i_hi  = np.searchsorted(s_asm,  obs_half)
+U_asm = U_asm_full[i_lo:i_hi, i_lo:i_hi]
+s_roi = s_asm[i_lo:i_hi]
+
+# ─── Comparison plot ───────────────────────────────────────────────────────────
+mm      = 1e-3
+ext_rs  = np.array([-obs_half, obs_half, -obs_half, obs_half]) / mm
+ext_asm = np.array([s_roi[0], s_roi[-1], s_roi[0], s_roi[-1]]) / mm
+
+fig, axes = plt.subplots(2, 2, figsize=(10, 9))
+(ax_rs_amp, ax_rs_ph), (ax_asm_amp, ax_asm_ph) = axes
+
+# RS row
+im = ax_rs_amp.imshow(np.abs(U_rs), extent=ext_rs, origin='lower',
+                      cmap='inferno', aspect='equal')
+ax_rs_amp.set_title("|U|  — Rayleigh-Sommerfeld")
+ax_rs_amp.set_xlabel("x  [mm]")
+ax_rs_amp.set_ylabel("z  [mm]")
+fig.colorbar(im, ax=ax_rs_amp, fraction=0.046)
+
+im = ax_rs_ph.imshow(np.angle(U_rs), extent=ext_rs, origin='lower',
+                     cmap='hsv', vmin=-np.pi, vmax=np.pi, aspect='equal')
+ax_rs_ph.set_title("∠U  — Rayleigh-Sommerfeld")
+ax_rs_ph.set_xlabel("x  [mm]")
+ax_rs_ph.set_ylabel("z  [mm]")
+fig.colorbar(im, ax=ax_rs_ph, label="[rad]", fraction=0.046)
+
+# ASM row
+im = ax_asm_amp.imshow(np.abs(U_asm), extent=ext_asm, origin='lower',
+                       cmap='inferno', aspect='equal')
+ax_asm_amp.set_title("|U|  — Angular Spectrum")
+ax_asm_amp.set_xlabel("x  [mm]")
+ax_asm_amp.set_ylabel("z  [mm]")
+fig.colorbar(im, ax=ax_asm_amp, fraction=0.046)
+
+im = ax_asm_ph.imshow(np.angle(U_asm), extent=ext_asm, origin='lower',
+                      cmap='hsv', vmin=-np.pi, vmax=np.pi, aspect='equal')
+ax_asm_ph.set_title("∠U  — Angular Spectrum")
+ax_asm_ph.set_xlabel("x  [mm]")
+ax_asm_ph.set_ylabel("z  [mm]")
+fig.colorbar(im, ax=ax_asm_ph, label="[rad]", fraction=0.046)
+
+fig.suptitle(
+    f"Diffraction at y = {obs_y*1e3:.0f} mm  "
+    f"(λ = {lam*1e9:.0f} nm,  r_ap = {r_ap*1e3:.0f} mm)",
+    fontweight='bold')
+plt.tight_layout()
+
+out = "diffraction.png"
+plt.savefig(out, dpi=150, bbox_inches='tight')
+plt.show()
+print(f"Saved → {out}")
