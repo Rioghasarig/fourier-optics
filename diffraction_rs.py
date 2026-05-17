@@ -83,6 +83,34 @@ def _rs_column(x0):
     return np.sum(integrand, axis=-1) * ds**2
 
 
+def _uap_chunk(args):
+    """Compute U_ap for a slice of rows [i_start, i_stop)."""
+    i_start, i_stop, N_asm, ds_asm, x2, y2, z2, r_ap, A, k = args
+    s_full = (np.arange(N_asm) - N_asm // 2) * ds_asm
+    s_z    = s_full[i_start:i_stop]
+    X_c, Z_c = np.meshgrid(s_full, s_z)
+    r21 = np.sqrt((X_c - x2)**2 + y2**2 + (Z_c - z2)**2)
+    return np.where(X_c**2 + Z_c**2 <= r_ap**2,
+                    A * np.exp(1j * k * r21) / r21,
+                    0+0j)
+
+
+def compute_uap_parallel(N_asm, ds_asm, P2, r_ap, A, k, n_workers=None):
+    """Build the aperture field in parallel by splitting rows across workers."""
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+    x2, y2, z2 = P2
+    chunk = (N_asm + n_workers - 1) // n_workers
+    tasks = [
+        (i, min(i + chunk, N_asm), N_asm, ds_asm, x2, y2, z2, r_ap, A, k)
+        for i in range(0, N_asm, chunk)
+    ]
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        chunks = list(tqdm(executor.map(_uap_chunk, tasks),
+                           total=len(tasks), desc="U_ap"))
+    return np.vstack(chunks)
+
+
 def _aperture_grid(r_ap: float, N_ap: int):
     """Uniform grid covering the aperture square with a circular mask."""
     s  = np.linspace(-r_ap, r_ap, N_ap)
@@ -205,15 +233,13 @@ def asm_plane(U_ap, ds, y0, k):
 
 # ─── Shared aperture field (used by both RS and ASM) ───────────────────────────
 # Grid satisfies ds ≤ λ/(2 sin θ_max) ≈ 12.5 µm and spans > ±obs_half.
-ds_asm = 8e-6    # 8 µm, safely below the 12.5 µm Nyquist limit
-N_asm  = 1024    # power-of-2 grid; total extent ≈ 8.19 mm (> 2 × obs_half)
+ds_asm = 2e-6    # 8 µm, safely below the 12.5 µm Nyquist limit
+N_asm  = 4096    # power-of-2 grid; total extent ≈ 8.19 mm (> 2 × obs_half)
 
 s_asm        = (np.arange(N_asm) - N_asm // 2) * ds_asm   # centered coordinates
 X_asm, Z_asm = np.meshgrid(s_asm, s_asm)
 
-x2, y2, z2 = P2
-r21_ap = np.sqrt((X_asm - x2)**2 + y2**2 + (Z_asm - z2)**2)
-U_ap   = np.where(X_asm**2 + Z_asm**2 <= r_ap**2,   A * np. exp(1j * k * r21_ap) / r21_ap, 0+0j)
+U_ap = compute_uap_parallel(N_asm, ds_asm, P2, r_ap, A, k)
 print(f"U_ap constructed: shape={U_ap.shape}, non-zero points={np.count_nonzero(U_ap)}")
 
 
