@@ -31,9 +31,9 @@ The integral is discretised with a uniform grid over the aperture square
 import os
 from concurrent.futures import ProcessPoolExecutor
 
-import numexpr as ne
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 # ─── Parameters ────────────────────────────────────────────────────────────────
@@ -55,17 +55,32 @@ N_ap = 400
 
 
 # ─── Core integral ──────────────────────────────────────────────────────────────
-def _rs_columns(args):
-    """Worker: RS integral for a contiguous slice of x observation coordinates."""
-    x_slice, y0, Z0, X1_ap, Z1_ap, Uap_ap, k, ds = args
+_worker_state: dict = {}
+
+
+def _init_worker(y0, Z0, X1_ap, Z1_ap, Uap_ap, k, ds):
+    """Pool initializer: store shared arrays once per worker process."""
+    _worker_state['y0']     = y0
+    _worker_state['Z0']     = Z0
+    _worker_state['X1_ap']  = X1_ap
+    _worker_state['Z1_ap']  = Z1_ap
+    _worker_state['Uap_ap'] = Uap_ap
+    _worker_state['k']      = k
+    _worker_state['ds']     = ds
+
+
+def _rs_column(x0):
+    """Worker: RS integral for a single x observation coordinate."""
+    y0, Z0     = _worker_state['y0'], _worker_state['Z0']
+    X1_ap      = _worker_state['X1_ap']
+    Z1_ap      = _worker_state['Z1_ap']
+    Uap_ap     = _worker_state['Uap_ap']
+    k, ds      = _worker_state['k'], _worker_state['ds']
     wavelength = 2 * np.pi / k
-    out = np.zeros((Z0.shape[0], len(x_slice)), dtype=complex)
-    for i, x0 in enumerate(x_slice):
-        r01       = np.sqrt((X1_ap - x0)**2 + y0**2 + (Z0 - Z1_ap)**2)
-        cos_theta = y0 / r01
-        integrand = Uap_ap * np.exp(1j * k * r01) / r01 * cos_theta / (1j * wavelength)
-        out[:, i] = np.sum(integrand, axis=-1) * ds**2
-    return out
+    r01        = np.sqrt((X1_ap - x0)**2 + y0**2 + (Z0 - Z1_ap)**2)
+    cos_theta  = y0 / r01
+    integrand  = Uap_ap * np.exp(1j * k * r01) / r01 * cos_theta / (1j * wavelength)
+    return np.sum(integrand, axis=-1) * ds**2
 
 
 def _aperture_grid(r_ap: float, N_ap: int):
@@ -144,14 +159,16 @@ def rs_plane(y0, x_obs, z_obs, k, U_ap, X1, Z1, ds, n_workers=None):
     if n_workers is None:
         n_workers = os.cpu_count() or 1
 
-    # Split x_obs into one chunk per worker; each chunk is computed independently.
-    chunks    = np.array_split(x_obs, n_workers)
-    task_args = [(c, y0, Z0, X1_ap, Z1_ap, Uap_ap, k, ds) for c in chunks]
+    # Each task is a single x column; shared arrays are sent once per worker via
+    # the initializer so they are not re-pickled for every task.
+    initargs = (y0, Z0, X1_ap, Z1_ap, Uap_ap, k, ds)
+    with ProcessPoolExecutor(max_workers=n_workers,
+                             initializer=_init_worker,
+                             initargs=initargs) as executor:
+        cols = list(tqdm(executor.map(_rs_column, x_obs),
+                         total=len(x_obs), desc="rs_plane"))
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        parts = list(executor.map(_rs_columns, task_args))
-
-    return np.concatenate(parts, axis=1)
+    return np.column_stack(cols)
 
 def asm_plane(U_ap, ds, y0, k):
     """
@@ -182,8 +199,8 @@ def asm_plane(U_ap, ds, y0, k):
     H = np.exp(1j * ky * y0)
     H[ky_sq < 0] = 0.0   # zero evanescent components
 
-    A_spec = np.fft.fft2(U_ap)
-    return np.fft.ifft2(A_spec * H)
+    A_spec = np.fft.fft2(np.fft.ifftshift(U_ap))
+    return np.fft.fftshift(np.fft.ifft2(A_spec * H))
 
 
 # ─── Shared aperture field (used by both RS and ASM) ───────────────────────────
@@ -195,9 +212,10 @@ s_asm        = (np.arange(N_asm) - N_asm // 2) * ds_asm   # centered coordinates
 X_asm, Z_asm = np.meshgrid(s_asm, s_asm)
 
 x2, y2, z2 = P2
-r21_ap = ne.evaluate("sqrt((X_asm - x2)**2 + y2**2 + (Z_asm - z2)**2)")
-U_ap   = ne.evaluate("where(X_asm**2 + Z_asm**2 <= r_ap**2,"
-                     "      A * exp(1j * k * r21_ap) / r21_ap, 0+0j)")
+r21_ap = np.sqrt((X_asm - x2)**2 + y2**2 + (Z_asm - z2)**2)
+U_ap   = np.where(X_asm**2 + Z_asm**2 <= r_ap**2,   A * np. exp(1j * k * r21_ap) / r21_ap, 0+0j)
+print(f"U_ap constructed: shape={U_ap.shape}, non-zero points={np.count_nonzero(U_ap)}")
+
 
 if __name__ == '__main__':
     # ─── RS simulation ─────────────────────────────────────────────────────────
